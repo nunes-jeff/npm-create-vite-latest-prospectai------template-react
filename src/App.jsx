@@ -1,10 +1,13 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 
 /* ═══════════════════════════════════════════════════════
    CONSTANTES GLOBAIS
 ══════════════════════════════════════════════════════════ */
-// Em produção, as chamadas vão para /api/search (Vercel Serverless Function)
-// que guarda a chave da Anthropic em variável de ambiente segura no servidor.
+const HEADERS = {
+  "Content-Type": "application/json",
+  "anthropic-version": "2023-06-01",
+  "anthropic-dangerous-direct-browser-access": "true",
+};
 
 const DEFAULT_TPL = `Olá, {nome}! 👋\n\nVi o perfil de vocês e gostaria de apresentar uma oportunidade que pode ajudar no crescimento do negócio.\n\nPosso te enviar mais detalhes?`;
 
@@ -43,19 +46,28 @@ const waLink = (p = "") => {
 const buildMsg = (tpl, nome) => tpl.replace(/\{nome\}/g, nome);
 
 async function buscarLeads(ramo, cidade, excluir = []) {
-  // Chama a Vercel Serverless Function em /api/search
-  // A chave da Anthropic fica segura no servidor (variável de ambiente)
-  const res = await fetch("/api/search", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ramo, cidade, excluir }),
+  const excStr = excluir.length
+    ? `\nNão retorne: ${excluir.slice(0,40).join(", ")}.` : "";
+  const prompt = `Faça uma busca no Google por estabelecimentos de "${ramo}" em "${cidade}", Brasil.${excStr}
+Extraia: nome, WhatsApp/telefone (formato BR), URL do Instagram.
+Retorne SOMENTE JSON puro:
+{"resultados":[{"nome":"Nome","whatsapp":"(11) 99999-9999","instagram":"https://instagram.com/perfil"}]}
+Regras: busque Google Maps, Instagram, sites. Até 10 resultados. whatsapp/instagram null se não encontrar.`;
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST", headers: HEADERS,
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514", max_tokens: 2000,
+      tools: [{ type: "web_search_20250305", name: "web_search" }],
+      messages: [{ role: "user", content: prompt }],
+    }),
   });
-  if (!res.ok) {
-    const e = await res.json().catch(() => ({}));
-    throw new Error(e?.error || `Erro ${res.status}`);
-  }
+  if (!res.ok) { const e = await res.json().catch(()=>{}); throw new Error(e?.error?.message || `HTTP ${res.status}`); }
   const data = await res.json();
-  return data.resultados || [];
+  const text = data.content?.find(b => b.type === "text")?.text || "";
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error("Nenhum resultado encontrado");
+  return JSON.parse(match[0]).resultados || [];
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -430,14 +442,13 @@ function LoginPage({ onSuccess, onBack }) {
 /* ═══════════════════════════════════════════════════════
    APP PRINCIPAL
 ══════════════════════════════════════════════════════════ */
-function MainApp({ onLogout, isDemo }) {
+function MainApp({ onLogout }) {
   const [tab, setTab]               = useState("prospector");
   const [ramo, setRamo]             = useState("");
   const [cidade, setCidade]         = useState("");
   const [resultados, setResultados] = useState([]);
   const [loading, setLoading]       = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [showUpgrade, setShowUpgrade] = useState(false);
   const [erro, setErro]             = useState("");
   const [buscou, setBuscou]         = useState(false);
   const [msgLead, setMsgLead]       = useState(null);
@@ -526,11 +537,7 @@ function MainApp({ onLogout, isDemo }) {
                 </button>
               ))}
             </div>
-            {isDemo && (
-              <div style={{ padding:"5px 12px", borderRadius:6, background:"rgba(251,191,36,0.1)", border:"1px solid rgba(251,191,36,0.3)", color:"#fbbf24", fontSize:11, fontWeight:700, letterSpacing:1 }}>
-                DEMO · 10 leads
-              </div>
-            )}
+
             <button onClick={onLogout} style={{ padding:"7px 14px", borderRadius:8, border:"1px solid #1e3248", background:"transparent", color:"#475569", fontSize:12, cursor:"pointer" }}>Sair</button>
           </div>
         </div>
@@ -625,7 +632,7 @@ function MainApp({ onLogout, isDemo }) {
 
             {!loading && buscou && (
               <div style={{ textAlign:"center", marginBottom:32 }}>
-                <button onClick={()=>{ if(isDemo){ setShowUpgrade(true); return; } buscar(true); }} disabled={loadingMore}
+                <button onClick={()=>buscar(true)} disabled={loadingMore}
                   style={{ display:"inline-flex",alignItems:"center",gap:8,padding:"12px 32px",borderRadius:10,background:"transparent",border:"1px solid #1e3248",color:loadingMore?"#334155":"#64748b",fontSize:14,fontWeight:600,cursor:loadingMore?"not-allowed":"pointer",transition:"all 0.2s" }}
                   onMouseOver={e=>{if(!loadingMore){e.currentTarget.style.borderColor="#22d3a5";e.currentTarget.style.color="#22d3a5";}}}
                   onMouseOut={e=>{e.currentTarget.style.borderColor="#1e3248";e.currentTarget.style.color=loadingMore?"#334155":"#64748b";}}>
@@ -696,36 +703,7 @@ function MainApp({ onLogout, isDemo }) {
         )}
       </div>
 
-      {showUpgrade && (
-        <div onClick={()=>setShowUpgrade(false)} style={{ position:"fixed",inset:0,background:"rgba(0,0,0,0.9)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:300,padding:16 }}>
-          <div onClick={e=>e.stopPropagation()} style={{ background:"linear-gradient(135deg,#0f1c2e,#0a1e35)",border:"2px solid #22d3a5",borderRadius:22,padding:"40px 32px",width:460,maxWidth:"100%",textAlign:"center",position:"relative" }}>
-            <button onClick={()=>setShowUpgrade(false)} style={{ position:"absolute",top:14,right:16,background:"transparent",border:"none",color:"#334155",fontSize:20,cursor:"pointer",lineHeight:1 }}>×</button>
-            <div style={{ fontSize:40,marginBottom:16 }}>🔒</div>
-            <div style={{ fontSize:11,fontWeight:700,color:"#fbbf24",letterSpacing:2,textTransform:"uppercase",marginBottom:10 }}>Limite da conta demo</div>
-            <h2 style={{ fontSize:22,fontWeight:900,marginBottom:10,letterSpacing:"-0.5px",color:"#e2eaf5" }}>Você atingiu os 10 leads gratuitos</h2>
-            <p style={{ fontSize:14,color:"#64748b",lineHeight:1.7,marginBottom:24 }}>
-              No plano demo você pode explorar até <strong style={{color:"#e2eaf5"}}>10 resultados</strong> por busca.<br/>
-              Com o acesso vitalício, prospecte leads <strong style={{color:"#22d3a5"}}>ilimitados</strong> em qualquer nicho e cidade.
-            </p>
-            <div style={{ background:"#0a1628",border:"1px solid #1e3248",borderRadius:14,padding:"20px 24px",marginBottom:24,textAlign:"left" }}>
-              {["Busca ilimitada de leads","Carregue quantos contatos quiser","CRM completo sem restrições","WhatsApp + Instagram de cada lead","Mensagem personalizada por contato","Sem mensalidade — pague uma vez"].map((item,i)=>(
-                <div key={i} style={{ display:"flex",alignItems:"center",gap:10,padding:"5px 0",fontSize:13,color:"#94a3b8" }}>
-                  <span style={{ color:"#22d3a5",fontWeight:700 }}>✓</span> {item}
-                </div>
-              ))}
-            </div>
-            <div style={{ display:"flex",alignItems:"flex-start",justifyContent:"center",gap:4,marginBottom:4 }}>
-              <span style={{ fontSize:16,color:"#64748b",marginTop:8,fontWeight:600 }}>R$</span>
-              <span style={{ fontSize:56,fontWeight:900,lineHeight:1,letterSpacing:"-2px",color:"#e2eaf5" }}>197</span>
-            </div>
-            <div style={{ fontSize:13,color:"#475569",textDecoration:"line-through",marginBottom:20 }}>De R$ 497 · Oferta por tempo limitado</div>
-            <a href="#" onClick={e=>{e.preventDefault();setShowUpgrade(false);}} style={{ display:"block",width:"100%",padding:"15px",borderRadius:12,border:"none",background:"linear-gradient(135deg,#22d3a5,#0ea5e9)",color:"#000",fontSize:16,fontWeight:800,cursor:"pointer",textDecoration:"none",boxShadow:"0 8px 30px rgba(34,211,165,0.3)",marginBottom:10 }}>
-              🚀 Quero acesso vitalício — R$ 197
-            </a>
-            <button onClick={()=>setShowUpgrade(false)} style={{ background:"transparent",border:"none",color:"#334155",fontSize:12,cursor:"pointer",padding:"6px" }}>Continuar com a versão demo</button>
-          </div>
-        </div>
-      )}
+
       {msgLead && <MsgModal lead={msgLead} template={template} onClose={()=>setMsgLead(null)} />}
       {showTpl  && <TemplateModal template={template} onClose={()=>setShowTpl(false)} onSave={t=>setTemplate(t)} />}
       {modalCrm && <CrmModal crm={modalCrm} onClose={()=>setModalCrm(null)} onSave={saveCrm} />}
@@ -752,8 +730,7 @@ export default function Root() {
     setView("landing");
   };
 
-  const isDemo = (() => { try { const s = JSON.parse(localStorage.getItem("prospectai_session")||"{}"); return s.email === DEMO_USER.email; } catch { return false; } })();
-  if (view === "app")     return <MainApp onLogout={logout} isDemo={isDemo} />;
+  if (view === "app")     return <MainApp onLogout={logout} />;
   if (view === "login")   return <LoginPage onSuccess={()=>setView("app")} onBack={()=>setView("landing")} />;
   return <LandingPage onLogin={()=>setView("login")} />;
 }

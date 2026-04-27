@@ -19,6 +19,21 @@ const DEMO_USER = { email: "demo@prospectai.com.br", pass: "prospect123" };
 /* ═══════════════════════════════════════════════════════
    HELPERS & API (GOOGLE GEMINI)
 ══════════════════════════════════════════════════════════ */
+const fmtPhone = (p = "") => {
+  const d = String(p).replace(/\D/g, "");
+  if (d.length === 11) return `(${d.slice(0,2)}) ${d.slice(2,7)}-${d.slice(7)}`;
+  if (d.length === 10) return `(${d.slice(0,2)}) ${d.slice(2,6)}-${d.slice(6)}`;
+  return p || null;
+};
+
+const igHandle = (url = "") => {
+  if (!url) return null;
+  try {
+    const h = new URL(url).pathname.replace(/\/+$/, "").split("/").filter(Boolean).pop() || "";
+    return h ? `@${h}` : null;
+  } catch { return null; }
+};
+
 const waLink = (p = "") => {
   const d = String(p).replace(/\D/g, "");
   return d.length >= 10 ? `https://wa.me/55${d}` : null;
@@ -26,17 +41,18 @@ const waLink = (p = "") => {
 
 const buildMsg = (tpl, nome) => tpl.replace(/\{nome\}/g, nome);
 
-// Função para obter a API Key de forma segura compatível com diversos ambientes
+// Função robusta para obter a API Key
 const getApiKey = () => {
+  const apiKey = ""; // A chave é injetada automaticamente pelo ambiente
+  if (apiKey) return apiKey;
+  
   try {
-    // Tenta primeiro o padrão do Vite (Vercel)
+    // Tenta variáveis de ambiente do Vite/Vercel
     if (typeof process !== 'undefined' && process.env?.VITE_GEMINI_API_KEY) return process.env.VITE_GEMINI_API_KEY;
-    // Fallback para o objeto import.meta com verificação de segurança para o compilador
     const meta = (import.meta);
     if (meta?.env?.VITE_GEMINI_API_KEY) return meta.env.VITE_GEMINI_API_KEY;
-  } catch (e) {
-    // Silencioso: se falhar, retorna vazio para evitar crash no build
-  }
+  } catch (e) {}
+  
   return ""; 
 };
 
@@ -47,7 +63,10 @@ async function fetchWithRetry(url, options, maxRetries = 5) {
       const res = await fetch(url, options);
       if (!res.ok) {
         const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.error?.message || `HTTP ${res.status}`);
+        if (res.status === 403 || res.status === 401) {
+            throw new Error("Erro de API Key: Verifique se a chave está configurada no Vercel.");
+        }
+        throw new Error(errorData.error?.message || `Erro HTTP ${res.status}`);
       }
       return await res.json();
     } catch (err) {
@@ -59,12 +78,12 @@ async function fetchWithRetry(url, options, maxRetries = 5) {
 
 async function buscarLeads(ramo, cidade, excluir = []) {
   const apiKey = getApiKey();
-  
-  const excStr = excluir.length ? `\nNão retorne: ${excluir.slice(0,20).join(", ")}.` : "";
-  
-  const prompt = `Encontre contatos reais de estabelecimentos do tipo "${ramo}" em "${cidade}", Brasil.${excStr}
-Extraia: nome, whatsapp (com DDD) e URL do Instagram.
-Retorne no máximo 10 resultados em formato JSON.`;
+  if (!apiKey) throw new Error("API Key não encontrada. Configure VITE_GEMINI_API_KEY.");
+
+  const prompt = `Encontre contatos reais de estabelecimentos do tipo "${ramo}" em "${cidade}", Brasil. 
+Extraia obrigatoriamente: nome, whatsapp (com DDD) e URL do Instagram.
+Retorne exatamente 10 resultados no formato JSON abaixo:
+{ "resultados": [{ "nome": "...", "whatsapp": "...", "instagram": "..." }] }`;
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
 
@@ -99,39 +118,56 @@ Retorne no máximo 10 resultados em formato JSON.`;
   });
 
   const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-  if (!text) throw new Error("A IA não retornou dados.");
-  
   try {
     return JSON.parse(text).resultados || [];
   } catch (err) {
-    throw new Error("Erro ao processar lista de leads.");
+    throw new Error("Falha ao processar dados da IA.");
   }
 }
 
 /* ═══════════════════════════════════════════════════════
-   COMPONENTES DE UI
+   COMPONENTES DE INTERFACE
 ══════════════════════════════════════════════════════════ */
+
+function CopyBtn({ value, label }) {
+  const [ok, setOk] = useState(false);
+  const copy = () => {
+    const clean = String(value).replace(/\D/g, "");
+    navigator.clipboard.writeText(clean);
+    setOk(true); setTimeout(() => setOk(false), 2000);
+  };
+  return (
+    <button onClick={copy} style={{ 
+      background: ok ? "rgba(34,211,165,0.1)" : "#0a1628",
+      color: ok ? "#22d3a5" : "#64748b",
+      border: `1px solid ${ok ? "#22d3a5" : "#1e3248"}`,
+      padding: "4px 8px", borderRadius: 6, cursor: "pointer", fontSize: 11
+    }}>
+      {ok ? "Copiado!" : label || "Copiar"}
+    </button>
+  );
+}
+
 function MsgModal({ lead, template, onClose }) {
   const [copied, setCopied] = useState(false);
   const msg = buildMsg(template, lead.nome);
   const wa = lead.whatsapp ? waLink(lead.whatsapp) : null;
   
   return (
-    <div onClick={onClose} style={{ position:"fixed",inset:0,background:"rgba(0,0,0,0.9)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200,padding:16 }}>
-      <div onClick={e=>e.stopPropagation()} style={{ background:"#0f1c2e",border:"1px solid #1e3248",borderRadius:18,padding:28,width:450,maxWidth:"100%" }}>
-        <div style={{ fontSize:18,fontWeight:800,marginBottom:20,color:"#e2eaf5" }}>{lead.nome}</div>
-        <div style={{ background:"#005c4b",borderRadius:12,padding:16,fontSize:14,color:"#e9ffef",lineHeight:1.6,marginBottom:16,whiteSpace:"pre-wrap" }}>{msg}</div>
-        <div style={{ display:"flex",gap:10 }}>
-          <button onClick={()=>{navigator.clipboard.writeText(msg); setCopied(true);}} style={{ flex:1,padding:12,borderRadius:10,border:"1px solid #1e3248",background:"transparent",color:copied?"#22d3a5":"#64748b",cursor:"pointer",fontWeight:700 }}>
-            {copied?"✓ Copiado":"📋 Copiar"}
+    <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.85)", backdropFilter:"blur(4px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200, padding:20 }}>
+      <div onClick={e=>e.stopPropagation()} style={{ background:"#0f1c2e", border:"1px solid #1e3248", borderRadius:24, padding:32, width:480, maxWidth:"100%", boxShadow: "0 25px 50px -12px rgba(0,0,0,0.5)" }}>
+        <div style={{ fontSize:20, fontWeight:800, marginBottom:20, color:"#fff" }}>Enviar Mensagem</div>
+        <div style={{ background:"#07111d", borderRadius:16, padding:20, fontSize:15, color:"#e2eaf5", lineHeight:1.6, marginBottom:24, border:"1px solid #1e3248", whiteSpace:"pre-wrap" }}>{msg}</div>
+        <div style={{ display:"flex", gap:12 }}>
+          <button onClick={()=>{navigator.clipboard.writeText(msg); setCopied(true);}} style={{ flex:1, padding:14, borderRadius:12, border:"1px solid #1e3248", background:"transparent", color:copied?"#22d3a5":"#fff", cursor:"pointer", fontWeight:700 }}>
+            {copied ? "✓ Copiado" : "Copiar Texto"}
           </button>
           {wa && (
-            <a href={`${wa}?text=${encodeURIComponent(msg)}`} target="_blank" rel="noreferrer" style={{ flex:1,padding:12,borderRadius:10,background:"#25d366",color:"#000",textAlign:"center",textDecoration:"none",fontWeight:700 }}>
+            <a href={`${wa}?text=${encodeURIComponent(msg)}`} target="_blank" rel="noreferrer" style={{ flex:1, padding:14, borderRadius:12, background:"#25d366", color:"#000", textAlign:"center", textDecoration:"none", fontWeight:800 }}>
               WhatsApp
             </a>
           )}
         </div>
-        <button onClick={onClose} style={{ width:"100%",marginTop:12,padding:8,background:"transparent",border:"none",color:"#475569",cursor:"pointer" }}>Fechar</button>
       </div>
     </div>
   );
@@ -140,14 +176,14 @@ function MsgModal({ lead, template, onClose }) {
 function TemplateModal({ template, onClose, onSave }) {
   const [val, setVal] = useState(template);
   return (
-    <div onClick={onClose} style={{ position:"fixed",inset:0,background:"rgba(0,0,0,0.9)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200 }}>
-      <div onClick={e=>e.stopPropagation()} style={{ background:"#0f1c2e",padding:24,borderRadius:16,width:500 }}>
-        <h3 style={{ marginTop:0 }}>Template da Mensagem</h3>
-        <textarea value={val} onChange={e=>setVal(e.target.value)} rows={6} style={{ width:"100%",background:"#0a1628",color:"#fff",padding:12,borderRadius:8,border:"1px solid #1e3248" }} />
-        <p style={{ fontSize:12, color:"#64748b" }}>Use {"{nome}"} para personalizar.</p>
-        <div style={{ display:"flex",justifyContent:"flex-end",gap:10 }}>
-          <button onClick={onClose} style={{ background:"transparent",color:"#64748b",border:"none" }}>Cancelar</button>
-          <button onClick={()=>{onSave(val); onClose();}} style={{ background:"#22d3a5",color:"#000",padding:"8px 20px",borderRadius:8,border:"none",fontWeight:700 }}>Salvar</button>
+    <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.85)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200 }}>
+      <div onClick={e=>e.stopPropagation()} style={{ background:"#0f1c2e", padding:32, borderRadius:24, width:500, border:"1px solid #1e3248" }}>
+        <h3 style={{ marginTop:0, color:"#fff" }}>Editar Template</h3>
+        <textarea value={val} onChange={e=>setVal(e.target.value)} rows={8} style={{ width:"100%", background:"#07111d", color:"#fff", padding:16, borderRadius:12, border:"1px solid #1e3248", fontSize:14, marginBottom:10 }} />
+        <p style={{ fontSize:12, color:"#64748b", marginBottom:24 }}>Use <b>{"{nome}"}</b> para inserir o nome do lead automaticamente.</p>
+        <div style={{ display:"flex", justifyContent:"flex-end", gap:12 }}>
+          <button onClick={onClose} style={{ background:"transparent", color:"#64748b", border:"none", cursor:"pointer" }}>Cancelar</button>
+          <button onClick={()=>{onSave(val); onClose();}} style={{ background:"#22d3a5", color:"#000", padding:"12px 24px", borderRadius:12, border:"none", fontWeight:800, cursor:"pointer" }}>Salvar Template</button>
         </div>
       </div>
     </div>
@@ -155,21 +191,25 @@ function TemplateModal({ template, onClose, onSave }) {
 }
 
 function CrmModal({ crm, onClose, onSave }) {
-  const [stage, setStage] = useState(crm?.stage||"novo");
-  const [notes, setNotes] = useState(crm?.notes||"");
+  const [stage, setStage] = useState(crm?.stage || "novo");
+  const [notes, setNotes] = useState(crm?.notes || "");
   return (
-    <div onClick={onClose} style={{ position:"fixed",inset:0,background:"rgba(0,0,0,0.9)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200 }}>
-      <div onClick={e=>e.stopPropagation()} style={{ background:"#0f1c2e",padding:24,borderRadius:16,width:400 }}>
-        <h3 style={{ marginTop:0 }}>{crm.nome}</h3>
-        <label style={{ display:"block",fontSize:12,color:"#64748b",marginBottom:4 }}>ESTÁGIO</label>
-        <select value={stage} onChange={e=>setStage(e.target.value)} style={{ width:"100%",padding:10,background:"#0a1628",color:"#fff",borderRadius:8,marginBottom:16 }}>
-          {Object.entries(STAGES).map(([k,s])=><option key={k} value={k}>{s.label}</option>)}
-        </select>
-        <label style={{ display:"block",fontSize:12,color:"#64748b",marginBottom:4 }}>NOTAS</label>
-        <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={4} style={{ width:"100%",background:"#0a1628",color:"#fff",padding:10,borderRadius:8 }} />
-        <div style={{ display:"flex",justifyContent:"flex-end",gap:10,marginTop:16 }}>
-          <button onClick={onClose} style={{ background:"transparent",color:"#64748b",border:"none" }}>Sair</button>
-          <button onClick={()=>onSave(crm.id,stage,notes)} style={{ background:"#22d3a5",color:"#000",padding:"8px 20px",borderRadius:8,border:"none",fontWeight:700 }}>Gravar</button>
+    <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.85)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200 }}>
+      <div onClick={e=>e.stopPropagation()} style={{ background:"#0f1c2e", padding:32, borderRadius:24, width:400, border:"1px solid #1e3248" }}>
+        <h3 style={{ marginTop:0, color:"#fff" }}>{crm.nome}</h3>
+        <div style={{ marginBottom:20 }}>
+          <label style={{ display:"block", fontSize:11, fontWeight:700, color:"#64748b", marginBottom:8, textTransform:"uppercase" }}>Estágio do Funil</label>
+          <select value={stage} onChange={e=>setStage(e.target.value)} style={{ width:"100%", padding:14, background:"#07111d", color:"#fff", borderRadius:12, border:"1px solid #1e3248" }}>
+            {Object.entries(STAGES).map(([k,s]) => <option key={k} value={k}>{s.label}</option>)}
+          </select>
+        </div>
+        <div style={{ marginBottom:24 }}>
+          <label style={{ display:"block", fontSize:11, fontWeight:700, color:"#64748b", marginBottom:8, textTransform:"uppercase" }}>Anotações</label>
+          <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={4} style={{ width:"100%", background:"#07111d", color:"#fff", padding:14, borderRadius:12, border:"1px solid #1e3248" }} placeholder="Detalhes da negociação..." />
+        </div>
+        <div style={{ display:"flex", gap:12 }}>
+          <button onClick={onClose} style={{ flex:1, background:"transparent", color:"#64748b", border:"none", cursor:"pointer" }}>Fechar</button>
+          <button onClick={()=>onSave(crm.id, stage, notes)} style={{ flex:2, background:"#22d3a5", color:"#000", padding:14, borderRadius:12, border:"none", fontWeight:800, cursor:"pointer" }}>Atualizar Lead</button>
         </div>
       </div>
     </div>
@@ -177,36 +217,37 @@ function CrmModal({ crm, onClose, onSave }) {
 }
 
 /* ═══════════════════════════════════════════════════════
-   PÁGINAS
+   PÁGINAS PRINCIPAIS
 ══════════════════════════════════════════════════════════ */
+
 function LandingPage({ onLogin }) {
   return (
-    <div style={{ background:"#060f1a", color:"#e2eaf5", minHeight:"100vh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", textAlign:"center", padding:20 }}>
-      <div style={{ width:60, height:60, background:"linear-gradient(135deg,#22d3a5,#0ea5e9)", borderRadius:15, display:"flex", alignItems:"center", justifyContent:"center", fontSize:32, marginBottom:24 }}>🎯</div>
-      <h1 style={{ fontSize:42, fontWeight:900, marginBottom:16 }}>ProspectAI Gemini</h1>
-      <p style={{ fontSize:18, color:"#94a3b8", maxWidth:500, lineHeight:1.6, marginBottom:32 }}>A ferramenta definitiva para encontrar leads com WhatsApp e Instagram usando Inteligência Artificial.</p>
-      <button onClick={onLogin} style={{ padding:"16px 48px", borderRadius:12, border:"none", background:"#22d3a5", color:"#000", fontSize:18, fontWeight:800, cursor:"pointer" }}>Começar Agora</button>
+    <div style={{ background:"#060f1a", color:"#e2eaf5", minHeight:"100vh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", textAlign:"center", padding:40 }}>
+      <div style={{ width:80, height:80, background:"linear-gradient(135deg,#22d3a5,#0ea5e9)", borderRadius:24, display:"flex", alignItems:"center", justifyContent:"center", fontSize:40, marginBottom:32, boxShadow:"0 20px 40px rgba(34,211,165,0.2)" }}>🎯</div>
+      <h1 style={{ fontSize:56, fontWeight:900, marginBottom:20, letterSpacing:"-0.02em" }}>ProspectAI <span style={{ color:"#22d3a5" }}>Gemini</span></h1>
+      <p style={{ fontSize:20, color:"#94a3b8", maxWidth:600, lineHeight:1.6, marginBottom:40 }}>Encontre leads qualificados com WhatsApp e Instagram em segundos usando o poder da Inteligência Artificial do Google.</p>
+      <button onClick={onLogin} style={{ padding:"20px 56px", borderRadius:16, border:"none", background:"#22d3a5", color:"#000", fontSize:20, fontWeight:800, cursor:"pointer", boxShadow:"0 10px 20px rgba(34,211,165,0.3)" }}>Começar Prospecção</button>
     </div>
   );
 }
 
 function LoginPage({ onSuccess, onBack }) {
   const [email, setEmail] = useState("");
-  const [pass, setPass]   = useState("");
-  const submit = () => {
+  const [pass, setPass] = useState("");
+  const handle = () => {
     if (email.trim().toLowerCase() === DEMO_USER.email && pass === DEMO_USER.pass) {
       localStorage.setItem("prospectai_session", "true");
       onSuccess();
-    } else { alert("Login incorreto. Use: demo@prospectai.com.br / prospect123"); }
+    } else { alert("Acesso negado. Use as credenciais demo."); }
   };
   return (
-    <div style={{ background:"#060f1a", minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center" }}>
-      <div style={{ background:"#0f1c2e", padding:40, borderRadius:20, width:380 }}>
-        <h2>Entrar</h2>
-        <input type="email" placeholder="E-mail" value={email} onChange={e=>setEmail(e.target.value)} style={{ width:"100%", padding:12, marginBottom:12, borderRadius:8, background:"#0a1628", color:"white", border:"1px solid #1e3248" }} />
-        <input type="password" placeholder="Senha" value={pass} onChange={e=>setPass(e.target.value)} style={{ width:"100%", padding:12, marginBottom:20, borderRadius:8, background:"#0a1628", color:"white", border:"1px solid #1e3248" }} />
-        <button onClick={submit} style={{ width:"100%", padding:12, background:"#22d3a5", border:"none", borderRadius:8, fontWeight:800, cursor:"pointer" }}>Acessar</button>
-        <button onClick={onBack} style={{ width:"100%", background:"transparent", border:"none", color:"#64748b", marginTop:16, cursor:"pointer" }}>Voltar</button>
+    <div style={{ background:"#060f1a", minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center", padding:20 }}>
+      <div style={{ background:"#0f1c2e", padding:48, borderRadius:32, width:400, border:"1px solid #1e3248" }}>
+        <h2 style={{ fontSize:28, fontWeight:800, marginBottom:32 }}>Bem-vindo</h2>
+        <input type="email" placeholder="E-mail" value={email} onChange={e=>setEmail(e.target.value)} style={{ width:"100%", padding:16, marginBottom:16, borderRadius:12, background:"#07111d", color:"#fff", border:"1px solid #1e3248" }} />
+        <input type="password" placeholder="Senha" value={pass} onChange={e=>setPass(e.target.value)} style={{ width:"100%", padding:16, marginBottom:32, borderRadius:12, background:"#07111d", color:"#fff", border:"1px solid #1e3248" }} />
+        <button onClick={handle} style={{ width:"100%", padding:18, background:"#22d3a5", border:"none", borderRadius:12, fontWeight:800, fontSize:16, cursor:"pointer" }}>Entrar no Painel</button>
+        <button onClick={onBack} style={{ width:"100%", background:"transparent", border:"none", color:"#64748b", marginTop:20, cursor:"pointer" }}>Voltar</button>
       </div>
     </div>
   );
@@ -224,13 +265,11 @@ function MainApp({ onLogout }) {
   const [template, setTemplate] = useState(DEFAULT_TPL);
   const [modalCrm, setModalCrm] = useState(null);
   const [crmLeads, setCrmLeads] = useState(() => {
-    try {
-      return JSON.parse(localStorage.getItem("prospectai_crm") || "[]");
-    } catch { return []; }
+    try { return JSON.parse(localStorage.getItem("prospectai_crm") || "[]"); } catch { return []; }
   });
 
   useEffect(() => { 
-    try { localStorage.setItem("prospectai_crm", JSON.stringify(crmLeads)); } catch {}
+    localStorage.setItem("prospectai_crm", JSON.stringify(crmLeads)); 
   }, [crmLeads]);
 
   const buscar = async () => {
@@ -246,65 +285,100 @@ function MainApp({ onLogout }) {
   const addToCRM = (l) => {
     if (crmLeads.find(c => c.nome === l.nome)) return;
     setCrmLeads([...crmLeads, { ...l, id: Date.now(), stage: "novo", notes: "" }]);
+    setTab("crm");
+  };
+
+  const removeLead = (id) => {
+    if (confirm("Remover este lead permanentemente?")) {
+      setCrmLeads(crmLeads.filter(l => l.id !== id));
+    }
   };
 
   return (
-    <div style={{ background:"#060f1a", minHeight:"100vh", color:"#e2eaf5", padding:20 }}>
-      <div style={{ maxWidth:1000, margin:"0 auto" }}>
-        <header style={{ display:"flex", justifyContent:"space-between", marginBottom:30, alignItems:"center" }}>
-          <div style={{ display:"flex", gap:10, alignItems:"center" }}>
-            <div style={{ width:32, height:32, background:"#22d3a5", borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center", color:"black", fontWeight:900 }}>P</div>
-            <span style={{ fontWeight:800, fontSize:18 }}>ProspectAI</span>
+    <div style={{ background:"#060f1a", minHeight:"100vh", color:"#e2eaf5" }}>
+      <div style={{ maxWidth:1200, margin:"0 auto", padding:"24px 20px" }}>
+        
+        {/* Header Fiel ao Original */}
+        <header style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:40, background:"#0f1c2e", padding:"16px 24px", borderRadius:20, border:"1px solid #1e3248" }}>
+          <div style={{ display:"flex", gap:12, alignItems:"center" }}>
+            <div style={{ width:36, height:36, background:"#22d3a5", borderRadius:10, display:"flex", alignItems:"center", justifyContent:"center", color:"#000", fontWeight:900 }}>P</div>
+            <span style={{ fontWeight:800, fontSize:20 }}>ProspectAI</span>
           </div>
-          <div style={{ display:"flex", gap:10 }}>
-            <button onClick={()=>setTab("prospector")} style={{ background:tab==="prospector"?"#22d3a5":"transparent", color:tab==="prospector"?"#000":"#64748b", padding:"8px 16px", borderRadius:8, border:"none", fontWeight:700, cursor:"pointer" }}>🔍 Buscar</button>
-            <button onClick={()=>setTab("crm")} style={{ background:tab==="crm"?"#22d3a5":"transparent", color:tab==="crm"?"#000":"#64748b", padding:"8px 16px", borderRadius:8, border:"none", fontWeight:700, cursor:"pointer" }}>📊 CRM ({crmLeads.length})</button>
-            <button onClick={onLogout} style={{ color:"#64748b", background:"transparent", border:"none", cursor:"pointer" }}>Sair</button>
+          <div style={{ display:"flex", gap:8, background:"#07111d", padding:6, borderRadius:14 }}>
+            <button onClick={()=>setTab("prospector")} style={{ background:tab==="prospector"?"#22d3a5":"transparent", color:tab==="prospector"?"#000":"#64748b", padding:"10px 20px", borderRadius:10, border:"none", fontWeight:800, cursor:"pointer" }}>🔍 Prospector</button>
+            <button onClick={()=>setTab("crm")} style={{ background:tab==="crm"?"#22d3a5":"transparent", color:tab==="crm"?"#000":"#64748b", padding:"10px 20px", borderRadius:10, border:"none", fontWeight:800, cursor:"pointer" }}>📊 CRM ({crmLeads.length})</button>
           </div>
+          <button onClick={onLogout} style={{ color:"#fb7185", background:"transparent", border:"none", fontWeight:700, cursor:"pointer" }}>Sair</button>
         </header>
 
         {tab === "prospector" ? (
-          <div>
-            <div style={{ background:"#0f1c2e", padding:20, borderRadius:16, display:"flex", gap:10, marginBottom:20 }}>
-              <input placeholder="Ex: Pet Shop" value={ramo} onChange={e=>setRamo(e.target.value)} style={{ flex:1, padding:12, borderRadius:8, background:"#0a1628", color:"#fff", border:"1px solid #1e3248" }} />
-              <input placeholder="Ex: São Paulo" value={cidade} onChange={e=>setCidade(e.target.value)} style={{ flex:1, padding:12, borderRadius:8, background:"#0a1628", color:"#fff", border:"1px solid #1e3248" }} />
-              <button onClick={buscar} disabled={loading} style={{ background:"#22d3a5", color:"#000", padding:"0 24px", borderRadius:8, fontWeight:800, cursor:"pointer", opacity: loading?0.7:1 }}>
-                {loading ? "Buscando..." : "Buscar"}
+          <div style={{ maxWidth:800, margin:"0 auto" }}>
+            <div style={{ textAlign:"center", marginBottom:40 }}>
+              <h2 style={{ fontSize:32, fontWeight:900, marginBottom:12 }}>Onde vamos buscar hoje?</h2>
+              <p style={{ color:"#64748b" }}>Defina o nicho e a localização para a IA encontrar seus próximos clientes.</p>
+            </div>
+
+            <div style={{ background:"#0f1c2e", padding:32, borderRadius:24, border:"1px solid #1e3248", marginBottom:40, display:"grid", gridTemplateColumns:"1fr 1fr auto", gap:16, alignItems:"end" }}>
+              <div>
+                <label style={{ display:"block", fontSize:11, fontWeight:800, color:"#64748b", marginBottom:10, textTransform:"uppercase" }}>Segmento</label>
+                <input placeholder="Ex: Escritórios de Advocacia" value={ramo} onChange={e=>setRamo(e.target.value)} style={{ width:"100%", padding:16, borderRadius:12, background:"#07111d", color:"#fff", border:"1px solid #1e3248" }} />
+              </div>
+              <div>
+                <label style={{ display:"block", fontSize:11, fontWeight:800, color:"#64748b", marginBottom:10, textTransform:"uppercase" }}>Cidade</label>
+                <input placeholder="Ex: Curitiba, PR" value={cidade} onChange={e=>setCidade(e.target.value)} style={{ width:"100%", padding:16, borderRadius:12, background:"#07111d", color:"#fff", border:"1px solid #1e3248" }} />
+              </div>
+              <button onClick={buscar} disabled={loading} style={{ background:"#22d3a5", color:"#000", padding:"18px 32px", borderRadius:12, fontWeight:900, fontSize:15, cursor:"pointer", opacity: loading?0.7:1 }}>
+                {loading ? "Buscando..." : "Explorar"}
               </button>
             </div>
-            {erro && <div style={{ background:"rgba(251,113,133,0.1)", border:"1px solid #fb7185", color:"#fb7185", padding:12, borderRadius:8, marginBottom:16 }}>{erro}</div>}
-            <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+
+            {erro && <div style={{ background:"rgba(251,113,133,0.1)", border:"1px solid #fb7185", color:"#fb7185", padding:16, borderRadius:12, marginBottom:24, textAlign:"center" }}>{erro}</div>}
+
+            <div style={{ display:"grid", gap:16 }}>
               {resultados.map((r, i) => (
-                <div key={i} style={{ background:"#0f1c2e", padding:16, borderRadius:12, display:"flex", alignItems:"center", justifyContent:"space-between", border:"1px solid #1e3248" }}>
-                  <div style={{ flex:1 }}>
-                    <div style={{ fontWeight:700, fontSize:16 }}>{r.nome}</div>
-                    <div style={{ fontSize:13, color:"#64748b", marginTop:4 }}>{r.whatsapp || "Sem whats"} • {r.instagram || "Sem insta"}</div>
+                <div key={i} style={{ background:"#0f1c2e", padding:24, borderRadius:20, border:"1px solid #1e3248", display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                  <div>
+                    <div style={{ fontWeight:800, fontSize:18, marginBottom:6 }}>{r.nome}</div>
+                    <div style={{ display:"flex", gap:16, fontSize:13, color:"#64748b" }}>
+                      <span>📱 {fmtPhone(r.whatsapp) || "Não informado"}</span>
+                      <span>📸 {igHandle(r.instagram) || "Não informado"}</span>
+                    </div>
                   </div>
-                  <div style={{ display:"flex", gap:10 }}>
-                    <button onClick={()=>setMsgLead(r)} style={{ background:"transparent", border:"1px solid #1e3248", color:"#64748b", padding:"8px 16px", borderRadius:8, cursor:"pointer" }}>Mensagem</button>
-                    <button onClick={()=>addToCRM(r)} style={{ background:"#22d3a5", color:"#000", padding:"8px 16px", borderRadius:8, fontWeight:700, cursor:"pointer" }}>+ CRM</button>
+                  <div style={{ display:"flex", gap:12 }}>
+                    <button onClick={()=>setMsgLead(r)} style={{ background:"transparent", border:"1px solid #1e3248", color:"#fff", padding:"10px 20px", borderRadius:10, fontWeight:700, cursor:"pointer" }}>Mensagem</button>
+                    <button onClick={()=>addToCRM(r)} style={{ background:"#22d3a5", color:"#000", padding:"10px 20px", borderRadius:10, fontWeight:800, cursor:"pointer" }}>Salvar no CRM</button>
                   </div>
                 </div>
               ))}
-              {!loading && resultados.length === 0 && <div style={{ textAlign:"center", padding:40, color:"#475569" }}>Faça uma busca para encontrar novos leads.</div>}
             </div>
           </div>
         ) : (
-          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(220px, 1fr))", gap:15, alignItems:"start" }}>
-             {Object.keys(STAGES).map(s => (
-               <div key={s} style={{ background:"#0f1c2e", borderRadius:12, padding:12, minHeight:400, border:"1px solid #1e3248" }}>
-                 <div style={{ color:STAGES[s].color, fontWeight:800, fontSize:12, marginBottom:12, display:"flex", alignItems:"center", gap:6 }}>
-                   <span style={{ width:8, height:8, background:STAGES[s].color, borderRadius:"50%" }}></span>
-                   {STAGES[s].label.split(" ")[1].toUpperCase()}
-                 </div>
-                 {crmLeads.filter(l => l.stage === s).map(l => (
-                   <div key={l.id} onClick={()=>setModalCrm(l)} style={{ background:"#0a1628", padding:12, borderRadius:10, marginBottom:10, cursor:"pointer", border:`1px solid #1e3248`, transition:"transform 0.2s" }} onMouseEnter={e=>e.currentTarget.style.transform="scale(1.02)"} onMouseLeave={e=>e.currentTarget.style.transform="scale(1)"}>
-                     <div style={{ fontSize:14, fontWeight:700, marginBottom:4 }}>{l.nome}</div>
-                     <div style={{ fontSize:11, color:"#64748b" }}>{l.whatsapp}</div>
-                   </div>
-                 ))}
-               </div>
-             ))}
+          <div>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:32 }}>
+              <h2 style={{ fontSize:28, fontWeight:900 }}>Funil de Vendas</h2>
+              <button onClick={()=>setShowTpl(true)} style={{ background:"#07111d", border:"1px solid #1e3248", color:"#64748b", padding:"10px 20px", borderRadius:12, fontWeight:700, cursor:"pointer" }}>⚙️ Configurar Mensagem</button>
+            </div>
+
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(250px, 1fr))", gap:20, alignItems:"start" }}>
+              {Object.keys(STAGES).map(s => (
+                <div key={s} style={{ background:"rgba(15,28,46,0.4)", borderRadius:24, padding:16, minHeight:500, border:"1px solid rgba(30,50,72,0.5)" }}>
+                  <div style={{ color:STAGES[s].color, fontWeight:900, fontSize:12, marginBottom:20, display:"flex", alignItems:"center", gap:8, textTransform:"uppercase", letterSpacing:1 }}>
+                    <span style={{ width:8, height:8, background:STAGES[s].color, borderRadius:10 }}></span>
+                    {STAGES[s].label}
+                  </div>
+                  {crmLeads.filter(l => l.stage === s).map(l => (
+                    <div key={l.id} style={{ background:"#0f1c2e", padding:20, borderRadius:18, marginBottom:12, border:"1px solid #1e3248", position:"relative" }}>
+                      <div style={{ fontWeight:800, fontSize:15, marginBottom:4, cursor:"pointer" }} onClick={()=>setModalCrm(l)}>{l.nome}</div>
+                      <div style={{ fontSize:12, color:"#64748b", marginBottom:16 }}>{fmtPhone(l.whatsapp)}</div>
+                      <div style={{ display:"flex", gap:8 }}>
+                        <button onClick={()=>setMsgLead(l)} style={{ flex:1, background:"#07111d", border:"1px solid #1e3248", color:"#e2eaf5", padding:8, borderRadius:8, fontSize:11, fontWeight:700, cursor:"pointer" }}>Enviar</button>
+                        <button onClick={()=>removeLead(l.id)} style={{ width:34, background:"transparent", border:"none", color:"#fb7185", cursor:"pointer", opacity:0.5 }}>🗑</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
           </div>
         )}
       </div>
@@ -321,9 +395,7 @@ function MainApp({ onLogout }) {
 
 export default function App() {
   const [view, setView] = useState(() => {
-    try {
-      return localStorage.getItem("prospectai_session") ? "app" : "landing";
-    } catch { return "landing"; }
+    try { return localStorage.getItem("prospectai_session") ? "app" : "landing"; } catch { return "landing"; }
   });
   
   if (view === "app") return <MainApp onLogout={()=>{localStorage.removeItem("prospectai_session"); setView("landing");}} />;

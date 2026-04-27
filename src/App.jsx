@@ -43,8 +43,8 @@ const buildMsg = (tpl, nome) => tpl.replace(/\{nome\}/g, nome);
 
 // Função robusta para obter a API Key
 const getApiKey = () => {
-  const apiKey = ""; // A chave é injetada automaticamente pelo ambiente
-  if (apiKey) return apiKey;
+const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
+   if (apiKey) return apiKey;
   
   try {
     // Tenta variáveis de ambiente do Vite/Vercel

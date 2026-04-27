@@ -3,12 +3,6 @@ import { useState, useCallback, useRef, useEffect } from "react";
 /* ═══════════════════════════════════════════════════════
    CONSTANTES GLOBAIS
 ══════════════════════════════════════════════════════════ */
-const HEADERS = {
-  "Content-Type": "application/json",
-  "anthropic-version": "2023-06-01",
-  "anthropic-dangerous-direct-browser-access": "true",
-};
-
 const DEFAULT_TPL = `Olá, {nome}! 👋\n\nVi o perfil de vocês e gostaria de apresentar uma oportunidade que pode ajudar no crescimento do negócio.\n\nPosso te enviar mais detalhes?`;
 
 const STAGES = {
@@ -24,7 +18,7 @@ const STAGES = {
 const DEMO_USER = { email: "demo@prospectai.com.br", pass: "prospect123" };
 
 /* ═══════════════════════════════════════════════════════
-   HELPERS
+   HELPERS & API (GOOGLE GEMINI)
 ══════════════════════════════════════════════════════════ */
 const fmtPhone = (p = "") => {
   const d = String(p).replace(/\D/g, "");
@@ -32,6 +26,7 @@ const fmtPhone = (p = "") => {
   if (d.length === 10) return `(${d.slice(0,2)}) ${d.slice(2,6)}-${d.slice(6)}`;
   return p || null;
 };
+
 const igHandle = (url = "") => {
   if (!url) return null;
   try {
@@ -39,35 +34,86 @@ const igHandle = (url = "") => {
     return h ? `@${h}` : null;
   } catch { return null; }
 };
+
 const waLink = (p = "") => {
   const d = String(p).replace(/\D/g, "");
   return d.length >= 10 ? `https://wa.me/55${d}` : null;
 };
+
 const buildMsg = (tpl, nome) => tpl.replace(/\{nome\}/g, nome);
 
-async function buscarLeads(ramo, cidade, excluir = []) {
-  const excStr = excluir.length
-    ? `\nNão retorne: ${excluir.slice(0,40).join(", ")}.` : "";
-  const prompt = `Faça uma busca no Google por estabelecimentos de "${ramo}" em "${cidade}", Brasil.${excStr}
-Extraia: nome, WhatsApp/telefone (formato BR), URL do Instagram.
-Retorne SOMENTE JSON puro:
-{"resultados":[{"nome":"Nome","whatsapp":"(11) 99999-9999","instagram":"https://instagram.com/perfil"}]}
-Regras: busque Google Maps, Instagram, sites. Até 10 resultados. whatsapp/instagram null se não encontrar.`;
+// Implementação de Backoff Exponencial para evitar erros de Rate Limit da API
+async function fetchWithRetry(url, options, maxRetries = 5) {
+  const delays = [1000, 2000, 4000, 8000, 16000];
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      const res = await fetch(url, options);
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.error?.message || `HTTP ${res.status}`);
+      }
+      return await res.json();
+    } catch (err) {
+      if (i === maxRetries - 1) throw err;
+      await new Promise(r => setTimeout(r, delays[i]));
+    }
+  }
+}
 
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST", headers: HEADERS,
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514", max_tokens: 2000,
-      tools: [{ type: "web_search_20250305", name: "web_search" }],
-      messages: [{ role: "user", content: prompt }],
-    }),
+async function buscarLeads(ramo, cidade, excluir = []) {
+  const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
+  const excStr = excluir.length ? `\nNão retorne de forma alguma os seguintes estabelecimentos: ${excluir.slice(0,40).join(", ")}.` : "";
+  
+  const prompt = `Faça uma busca na internet para encontrar contatos reais de estabelecimentos comerciais do tipo "${ramo}" na cidade de "${cidade}", Brasil.${excStr}
+Extraia o nome do estabelecimento, o número de WhatsApp ou telefone celular (no formato BR com DDD) e a URL do perfil do Instagram.
+Regras: 
+1. Busque informações precisas e reais de mapas e sites.
+2. Se não encontrar o número ou o instagram, retorne uma string vazia "".
+3. Retorne no máximo 10 resultados.`;
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+
+  const payload = {
+    contents: [{ parts: [{ text: prompt }] }],
+    tools: [{ google_search: {} }], // Habilita pesquisa em tempo real do Google
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: "OBJECT",
+        properties: {
+          resultados: {
+            type: "ARRAY",
+            items: {
+              type: "OBJECT",
+              properties: {
+                nome: { type: "STRING" },
+                whatsapp: { type: "STRING", description: "Deixe em branco '' caso não encontre." },
+                instagram: { type: "STRING", description: "Deixe em branco '' caso não encontre." }
+              },
+              required: ["nome", "whatsapp", "instagram"]
+            }
+          }
+        }
+      }
+    }
+  };
+
+  const data = await fetchWithRetry(url, {
+    method: "POST", 
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
   });
-  if (!res.ok) { const e = await res.json().catch(()=>{}); throw new Error(e?.error?.message || `HTTP ${res.status}`); }
-  const data = await res.json();
-  const text = data.content?.find(b => b.type === "text")?.text || "";
-  const match = text.match(/\{[\s\S]*\}/);
-  if (!match) throw new Error("Nenhum resultado encontrado");
-  return JSON.parse(match[0]).resultados || [];
+
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  
+  if (!text) throw new Error("Nenhum resultado encontrado pela API.");
+  
+  try {
+    const parsed = JSON.parse(text);
+    return parsed.resultados || [];
+  } catch (err) {
+    throw new Error("Falha ao analisar a resposta JSON do Google Gemini.");
+  }
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -96,11 +142,13 @@ function MsgModal({ lead, template, onClose }) {
   const msg = buildMsg(template, lead.nome);
   const wa = lead.whatsapp ? waLink(lead.whatsapp) : null;
   const waMsg = wa ? `${wa}?text=${encodeURIComponent(msg)}` : null;
+  
   const copy = () => {
     const fb=()=>{ const t=document.createElement("textarea"); t.value=msg; t.style.cssText="position:fixed;opacity:0"; document.body.appendChild(t); t.select(); document.execCommand("copy"); document.body.removeChild(t); };
     navigator.clipboard ? navigator.clipboard.writeText(msg).catch(fb) : fb();
     setCopied(true); setTimeout(()=>setCopied(false),2500);
   };
+  
   return (
     <div onClick={onClose} style={{ position:"fixed",inset:0,background:"rgba(0,0,0,0.88)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200,padding:16 }}>
       <div onClick={e=>e.stopPropagation()} style={{ background:"#0f1c2e",border:"1px solid #1e3248",borderRadius:18,padding:28,width:480,maxWidth:"100%" }}>
@@ -131,6 +179,7 @@ function MsgModal({ lead, template, onClose }) {
 function TemplateModal({ template, onClose, onSave }) {
   const [val, setVal] = useState(template);
   const ref = useRef(null);
+  
   const insert = (tag) => {
     const ta=ref.current;
     if (!ta){ setVal(v=>v+tag); return; }
@@ -138,6 +187,7 @@ function TemplateModal({ template, onClose, onSave }) {
     setVal(val.slice(0,s)+tag+val.slice(e));
     setTimeout(()=>{ ta.selectionStart=ta.selectionEnd=s+tag.length; ta.focus(); },0);
   };
+  
   return (
     <div onClick={onClose} style={{ position:"fixed",inset:0,background:"rgba(0,0,0,0.88)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200,padding:16 }}>
       <div onClick={e=>e.stopPropagation()} style={{ background:"#0f1c2e",border:"1px solid #1e3248",borderRadius:18,padding:28,width:520,maxWidth:"100%" }}>
@@ -158,6 +208,7 @@ function TemplateModal({ template, onClose, onSave }) {
 function CrmModal({ crm, onClose, onSave }) {
   const [stage, setStage] = useState(crm?.stage||"novo");
   const [notes, setNotes] = useState(crm?.notes||"");
+  
   if (!crm) return null;
   return (
     <div onClick={onClose} style={{ position:"fixed",inset:0,background:"rgba(0,0,0,0.88)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200,padding:16 }}>
@@ -189,12 +240,12 @@ function CrmModal({ crm, onClose, onSave }) {
 ══════════════════════════════════════════════════════════ */
 function LandingPage({ onLogin }) {
   const features = [
-    { icon:"🔍", title:"Busca Inteligente", desc:"Pesquisa no Google em tempo real e extrai nome, WhatsApp e Instagram de qualquer nicho e cidade do Brasil." },
+    { icon:"🔍", title:"Busca Inteligente (Gemini)", desc:"Pesquisa no Google em tempo real e extrai nome, WhatsApp e Instagram de qualquer nicho e cidade do Brasil." },
     { icon:"📸", title:"Instagram Direto", desc:"Link clicável para o perfil de cada lead encontrado. Acesse o Instagram do prospect com um toque." },
     { icon:"💬", title:"Mensagem Personalizada", desc:"Gere uma mensagem com o nome do lead pronta para copiar e colar no WhatsApp. Zero tempo perdido." },
     { icon:"📊", title:"CRM Integrado", desc:"Pipeline kanban com 6 etapas: Novo, Contatado, Interessado, Negociando, Convertido e Descartado." },
     { icon:"💾", title:"Dados Salvos", desc:"Seus leads e estágios do CRM ficam salvos automaticamente. Nunca perca um contato importante." },
-    { icon:"🔄", title:"Carga Ilimitada", desc:"Carregue mais 10 contatos com um clique. Prospecte dezenas de leads por sessão sem repetir resultados." },
+    { icon:"🔄", title:"Carga Ilimitada", desc:"Carregue mais contatos com um clique. Prospecte dezenas de leads por sessão sem repetir resultados." },
   ];
 
   const testimonials = [
@@ -231,7 +282,7 @@ function LandingPage({ onLogin }) {
       {/* HERO */}
       <section style={{ textAlign:"center", padding:"80px 24px 60px", maxWidth:780, margin:"0 auto" }}>
         <div style={{ display:"inline-block", padding:"5px 16px", borderRadius:20, border:"1px solid #22d3a540", background:"rgba(34,211,165,0.06)", fontSize:12, color:"#22d3a5", fontWeight:700, letterSpacing:2, marginBottom:28, textTransform:"uppercase" }}>
-          Prospecção inteligente com IA
+          Prospecção inteligente com IA Google
         </div>
         <h1 style={{ fontSize:"clamp(2rem,5vw,3.5rem)", fontWeight:900, lineHeight:1.1, marginBottom:20, letterSpacing:"-1px" }}>
           Encontre clientes com<br />
@@ -245,13 +296,9 @@ function LandingPage({ onLogin }) {
         </p>
         <div style={{ display:"flex", gap:12, justifyContent:"center", flexWrap:"wrap" }}>
           <button className="cta-btn" onClick={onLogin} style={{ padding:"16px 40px", borderRadius:12, border:"none", background:"linear-gradient(135deg,#22d3a5,#0ea5e9)", color:"#000", fontSize:16, fontWeight:800, cursor:"pointer", boxShadow:"0 8px 30px rgba(34,211,165,0.25)" }}>
-            🚀 Começar agora — R$ 197
-          </button>
-          <button className="cta-btn" onClick={onLogin} style={{ padding:"16px 32px", borderRadius:12, border:"1px solid #1e3248", background:"transparent", color:"#94a3b8", fontSize:16, fontWeight:600, cursor:"pointer" }}>
-            Ver demonstração →
+            🚀 Começar agora
           </button>
         </div>
-        <div style={{ marginTop:20, fontSize:13, color:"#475569" }}>✓ Acesso vitalício &nbsp;·&nbsp; ✓ Sem mensalidade &nbsp;·&nbsp; ✓ Ativação imediata</div>
       </section>
 
       {/* MOCKUP */}
@@ -291,87 +338,6 @@ function LandingPage({ onLogin }) {
             </div>
           ))}
         </div>
-      </section>
-
-      {/* DEPOIMENTOS */}
-      <section style={{ maxWidth:860, margin:"0 auto 80px", padding:"0 24px" }}>
-        <h2 style={{ textAlign:"center", fontSize:"clamp(1.5rem,3vw,2.2rem)", fontWeight:800, marginBottom:48, letterSpacing:"-0.5px" }}>
-          Quem já usa, aprova
-        </h2>
-        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(240px,1fr))", gap:16 }}>
-          {testimonials.map((t, i) => (
-            <div key={i} className="test-card" style={{ background:"#0f1c2e", border:"1px solid #1e3248", borderRadius:14, padding:"22px" }}>
-              <div style={{ color:"#fbbf24", fontSize:14, marginBottom:12 }}>{"★".repeat(t.stars)}</div>
-              <p style={{ fontSize:14, color:"#94a3b8", lineHeight:1.65, marginBottom:16, fontStyle:"italic" }}>"{t.text}"</p>
-              <div style={{ fontWeight:700, fontSize:13 }}>{t.name}</div>
-              <div style={{ fontSize:11, color:"#475569", marginTop:3 }}>{t.role}</div>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      {/* PRICING */}
-      <section style={{ maxWidth:500, margin:"0 auto 80px", padding:"0 24px" }} id="preco">
-        <h2 style={{ textAlign:"center", fontSize:"clamp(1.5rem,3vw,2.2rem)", fontWeight:800, marginBottom:8, letterSpacing:"-0.5px" }}>
-          Investimento único
-        </h2>
-        <p style={{ textAlign:"center", color:"#64748b", marginBottom:36, fontSize:15 }}>Pague uma vez, use para sempre.</p>
-        <div style={{ background:"linear-gradient(135deg,#0f1c2e,#0a1e35)", border:"2px solid #22d3a5", borderRadius:20, padding:"36px 32px", textAlign:"center", position:"relative", overflow:"hidden" }}>
-          <div style={{ position:"absolute", top:16, right:16, background:"#22d3a5", color:"#000", fontSize:11, fontWeight:800, padding:"4px 12px", borderRadius:20, letterSpacing:1 }}>MAIS POPULAR</div>
-          <div style={{ fontSize:13, color:"#22d3a5", fontWeight:700, letterSpacing:2, textTransform:"uppercase", marginBottom:12 }}>Acesso Vitalício</div>
-          <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"center", gap:4, marginBottom:6 }}>
-            <span style={{ fontSize:18, color:"#64748b", marginTop:10, fontWeight:600 }}>R$</span>
-            <span style={{ fontSize:68, fontWeight:900, lineHeight:1, letterSpacing:"-3px", color:"#e2eaf5" }}>197</span>
-          </div>
-          <div style={{ color:"#475569", fontSize:13, marginBottom:28, textDecoration:"line-through" }}>De R$ 497 · Oferta por tempo limitado</div>
-          <ul style={{ listStyle:"none", padding:0, margin:"0 0 28px", textAlign:"left" }}>
-            {[
-              "✓ Busca ilimitada por nicho e cidade",
-              "✓ WhatsApp + Instagram de cada lead",
-              "✓ Mensagem personalizada por contato",
-              "✓ CRM kanban com 6 estágios",
-              "✓ Dados salvos automaticamente",
-              "✓ Atualizações inclusas",
-              "✓ Sem mensalidade, nunca",
-            ].map((item, i) => (
-              <li key={i} style={{ fontSize:14, color:"#94a3b8", padding:"5px 0", display:"flex", alignItems:"center", gap:8 }}>
-                <span style={{ color:"#22d3a5" }}>{item.slice(0,1)}</span>
-                <span>{item.slice(2)}</span>
-              </li>
-            ))}
-          </ul>
-          <button className="cta-btn" onClick={onLogin} style={{ width:"100%", padding:"16px", borderRadius:12, border:"none", background:"linear-gradient(135deg,#22d3a5,#0ea5e9)", color:"#000", fontSize:16, fontWeight:800, cursor:"pointer", boxShadow:"0 8px 30px rgba(34,211,165,0.25)" }}>
-            Quero meu acesso agora →
-          </button>
-          <div style={{ marginTop:14, fontSize:12, color:"#475569" }}>🔒 Pagamento seguro · Acesso imediato após confirmação</div>
-        </div>
-      </section>
-
-      {/* FAQ */}
-      <section style={{ maxWidth:620, margin:"0 auto 80px", padding:"0 24px" }}>
-        <h2 style={{ textAlign:"center", fontSize:"1.6rem", fontWeight:800, marginBottom:32, letterSpacing:"-0.5px" }}>Perguntas frequentes</h2>
-        {[
-          ["Os dados são reais?", "Sim. A busca usa IA com acesso ao Google em tempo real. Os contatos e perfis encontrados são de estabelecimentos reais."],
-          ["Precisa pagar mensalidade?", "Não. O pagamento é único e o acesso é vitalício. Sem surpresas na fatura."],
-          ["Funciona para qualquer nicho?", "Sim. Academia, clínica, salão, restaurante, imobiliária, escritório — qualquer segmento e qualquer cidade do Brasil."],
-          ["Como acesso após a compra?", "Você recebe login e senha por e-mail imediatamente após a confirmação do pagamento."],
-        ].map(([q, a], i) => (
-          <div key={i} style={{ borderBottom:"1px solid #1e3248", padding:"18px 0" }}>
-            <div style={{ fontWeight:700, fontSize:15, marginBottom:8 }}>{q}</div>
-            <div style={{ fontSize:14, color:"#64748b", lineHeight:1.6 }}>{a}</div>
-          </div>
-        ))}
-      </section>
-
-      {/* FOOTER CTA */}
-      <section style={{ textAlign:"center", padding:"60px 24px 80px", borderTop:"1px solid #0f2236" }}>
-        <h2 style={{ fontSize:"clamp(1.5rem,3vw,2rem)", fontWeight:800, marginBottom:16, letterSpacing:"-0.5px" }}>
-          Pronto para prospectar do jeito certo?
-        </h2>
-        <p style={{ color:"#64748b", marginBottom:28, fontSize:15 }}>Acesso vitalício por R$ 197. Sem mensalidade.</p>
-        <button className="cta-btn" onClick={onLogin} style={{ padding:"16px 48px", borderRadius:12, border:"none", background:"linear-gradient(135deg,#22d3a5,#0ea5e9)", color:"#000", fontSize:16, fontWeight:800, cursor:"pointer", boxShadow:"0 8px 30px rgba(34,211,165,0.25)" }}>
-          🚀 Começar agora
-        </button>
       </section>
     </div>
   );
@@ -416,12 +382,12 @@ function LoginPage({ onSuccess, onBack }) {
 
         <div style={{ marginBottom:16 }}>
           <label style={{ fontSize:11, color:"#64748b", letterSpacing:1, display:"block", marginBottom:7 }}>E-MAIL</label>
-          <input value={email} onChange={e=>setEmail(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()} type="email" placeholder="seu@email.com"
+          <input value={email} onChange={e=>setEmail(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()} type="email" placeholder="demo@prospectai.com.br"
             style={{ width:"100%", padding:"12px 14px", background:"#0a1628", border:"1px solid #1e3248", borderRadius:9, color:"#e2eaf5", fontSize:14, outline:"none", fontFamily:"inherit" }} />
         </div>
         <div style={{ marginBottom:24 }}>
           <label style={{ fontSize:11, color:"#64748b", letterSpacing:1, display:"block", marginBottom:7 }}>SENHA</label>
-          <input value={pass} onChange={e=>setPass(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()} type="password" placeholder="••••••••"
+          <input value={pass} onChange={e=>setPass(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()} type="password" placeholder="prospect123"
             style={{ width:"100%", padding:"12px 14px", background:"#0a1628", border:"1px solid #1e3248", borderRadius:9, color:"#e2eaf5", fontSize:14, outline:"none", fontFamily:"inherit" }} />
         </div>
 
@@ -440,7 +406,7 @@ function LoginPage({ onSuccess, onBack }) {
 }
 
 /* ═══════════════════════════════════════════════════════
-   APP PRINCIPAL
+   APP PRINCIPAL (DASHBOARD)
 ══════════════════════════════════════════════════════════ */
 function MainApp({ onLogout }) {
   const [tab, setTab]               = useState("prospector");
@@ -461,6 +427,7 @@ function MainApp({ onLogout }) {
   const [crmLeads, setCrmLeadsRaw] = useState(() => {
     try { return JSON.parse(localStorage.getItem("prospectai_crm") || "[]"); } catch { return []; }
   });
+  
   const setCrmLeads = useCallback((updater) => {
     setCrmLeadsRaw(prev => {
       const next = typeof updater === "function" ? updater(prev) : updater;
@@ -474,13 +441,17 @@ function MainApp({ onLogout }) {
     setErro("");
     append ? setLoadingMore(true) : setLoading(true);
     if (!append) { setResultados([]); nomesRef.current = new Set(); setBuscou(false); }
+    
     try {
       const excluir = [...nomesRef.current];
       const dados = await buscarLeads(ramo.trim(), cidade.trim(), append ? excluir : []);
       dados.forEach(d => nomesRef.current.add(d.nome));
       setResultados(prev => append ? [...prev, ...dados] : dados);
       setBuscou(true);
-    } catch (e) { setErro("Erro: " + e.message); }
+    } catch (e) { 
+      setErro(e.message || "Ocorreu um erro ao buscar os leads"); 
+    }
+    
     append ? setLoadingMore(false) : setLoading(false);
   }, [ramo, cidade]);
 
@@ -525,7 +496,7 @@ function MainApp({ onLogout }) {
             <div style={{ width:36, height:36, background:"linear-gradient(135deg,#22d3a5,#0ea5e9)", borderRadius:9, display:"flex", alignItems:"center", justifyContent:"center", fontSize:20 }}>🎯</div>
             <div>
               <div style={{ fontSize:18, fontWeight:800, letterSpacing:"-0.5px" }}>ProspectAI</div>
-              <div style={{ fontSize:11, color:"#475569", fontFamily:"monospace" }}>nome · whatsapp · instagram</div>
+              <div style={{ fontSize:11, color:"#475569", fontFamily:"monospace" }}>Powered by Google Gemini</div>
             </div>
           </div>
           <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
@@ -568,7 +539,7 @@ function MainApp({ onLogout }) {
             {loading && (
               <div style={{ textAlign:"center", padding:"48px 0" }}>
                 <div style={{ width:38, height:38, border:"3px solid #1e3248", borderTopColor:"#22d3a5", borderRadius:"50%", animation:"spin 0.8s linear infinite", margin:"0 auto 12px" }} />
-                <div style={{ fontFamily:"monospace", fontSize:13, color:"#22d3a5" }}>Pesquisando no Google...</div>
+                <div style={{ fontFamily:"monospace", fontSize:13, color:"#22d3a5" }}>Pesquisando no Google com Gemini...</div>
               </div>
             )}
 
@@ -590,6 +561,7 @@ function MainApp({ onLogout }) {
                   const ig    = r.instagram || null;
                   const handle = igHandle(ig);
                   const jaNocrm = !!crmLeads.find(c => c.sourceId === r.nome);
+                  
                   return (
                     <div key={i} style={{ background:"#0f1c2e", border:"1px solid #1e3248", borderRadius:12, padding:"14px 18px", display:"flex", alignItems:"center", gap:14, flexWrap:"wrap", animation:`fadeIn 0.25s ease ${i*0.04}s both` }}>
                       <div style={{ width:24,height:24,borderRadius:"50%",background:"#0a1628",border:"1px solid #1e3248",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,color:"#334155",fontFamily:"monospace",flexShrink:0 }}>{i+1}</div>
@@ -636,7 +608,7 @@ function MainApp({ onLogout }) {
                   style={{ display:"inline-flex",alignItems:"center",gap:8,padding:"12px 32px",borderRadius:10,background:"transparent",border:"1px solid #1e3248",color:loadingMore?"#334155":"#64748b",fontSize:14,fontWeight:600,cursor:loadingMore?"not-allowed":"pointer",transition:"all 0.2s" }}
                   onMouseOver={e=>{if(!loadingMore){e.currentTarget.style.borderColor="#22d3a5";e.currentTarget.style.color="#22d3a5";}}}
                   onMouseOut={e=>{e.currentTarget.style.borderColor="#1e3248";e.currentTarget.style.color=loadingMore?"#334155":"#64748b";}}>
-                  {loadingMore ? <><span style={{ width:14,height:14,border:"2px solid #334155",borderTopColor:"#64748b",borderRadius:"50%",animation:"spin 0.7s linear infinite",display:"inline-block" }} />Carregando...</> : "🔄 Carregar mais 10 contatos"}
+                  {loadingMore ? <><span style={{ width:14,height:14,border:"2px solid #334155",borderTopColor:"#64748b",borderRadius:"50%",animation:"spin 0.7s linear infinite",display:"inline-block" }} />Carregando...</> : "🔄 Carregar mais resultados"}
                 </button>
               </div>
             )}
@@ -703,7 +675,6 @@ function MainApp({ onLogout }) {
         )}
       </div>
 
-
       {msgLead && <MsgModal lead={msgLead} template={template} onClose={()=>setMsgLead(null)} />}
       {showTpl  && <TemplateModal template={template} onClose={()=>setShowTpl(false)} onSave={t=>setTemplate(t)} />}
       {modalCrm && <CrmModal crm={modalCrm} onClose={()=>setModalCrm(null)} onSave={saveCrm} />}
@@ -712,9 +683,9 @@ function MainApp({ onLogout }) {
 }
 
 /* ═══════════════════════════════════════════════════════
-   ROTEADOR RAIZ
+   ROTEADOR RAIZ (DEFAULT EXPORT)
 ══════════════════════════════════════════════════════════ */
-export default function Root() {
+export default function App() {
   const getView = () => {
     try {
       const s = localStorage.getItem("prospectai_session");
